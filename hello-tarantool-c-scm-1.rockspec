@@ -7,6 +7,7 @@ source = {
 dependencies = {
   "tarantool"
 }
+
 build = {
   type = "builtin",
   modules = {

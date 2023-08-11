@@ -1,2 +1,5 @@
 hello = require("hello")
-print(hello.say_hello())
+print(hello.say_hello("Ivan"))
+print(hello.say_hello("PETER"))
+print(hello.say_hello("OLOLOSKOKABUKOV"))
+print(hello.say_hello("OLOLOSKOKABUKOV ESCHE I S PROBELOM"))
