@@ -3,12 +3,13 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <fcntl.h>
 
-#include <string.h>
+
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/poll.h>
@@ -18,114 +19,16 @@
 #include "lualib.h"
 #include "module.h"
 
-static int va_mkdir(va_list ap) {
-  const char* dirname = va_arg(ap, char*);
-  mode_t mode = 777;
-  pthread_t pid = pthread_self();
-  for (int i = 0; i <= 10; i++) {
-    if (mkdir(dirname, mode) == -1) {
-      say_warn("Pid: %d: Directory %s has already created", (int)pid, dirname);
-    } else {
-      say_warn("Pid: %d: Directory %s has created", (int)pid, dirname);
-    }
-  }
-  return 0;
-}
+pthread_mutex_t m;
 
-/*
-  Lua analog:
-  local function mktree(path)
-      checks('string')
-      path = fio.abspath(path)
 
-      local path = string.gsub(path, '^/', '')
-      local dirs = string.split(path, "/")
-
-      local current_dir = "/"
-      for _, dir in ipairs(dirs) do
-          current_dir = fio.pathjoin(current_dir, dir)
-          local stat = fio.stat(current_dir)
-          if stat == nil then
-              local _, err = fio.mkdir(current_dir)
-              local _errno = errno()
-              if err ~= nil and not fio.path.is_dir(current_dir) then
-                  return nil, errors.new('MktreeError',
-                      'Error creating directory %q: %s',
-                      current_dir, errno.strerror(_errno)
-                  )
-              end
-          elseif not stat:is_dir() then
-              local EEXIST = assert(errno.EEXIST)
-              return nil, errors.new('MktreeError',
-                  'Error creating directory %q: %s',
-                  current_dir, errno.strerror(EEXIST)
-              )
-          end
-      end
-      return true
-  end
-*/
-
-// TODO: make sure that len has correct value (and used correct in "for")
-static int mktree(char** dirs, int len) {
-  // FIXME: here possible buffer overflow
-  char current_dir[256] = ".";
-  for (int i = 0; i <= len - 1; i++) {
-    char* tmp_dir = current_dir;
-    sprintf(current_dir, "%s/%s", tmp_dir, dirs[i]);
-    mode_t mode = 0777;
-    struct stat* st;
-    say_info("curdir: %s", current_dir);
-    int stat_rc = stat(current_dir, st);
-    if(stat_rc == -1) {
-      if(mkdir(current_dir, mode) ==  -1) {
-        say_error("cant 'mkdir': %s", strerror(errno));
-        return -1;
-      } else {
-        say_info("Directory '%s' has created", current_dir);
-      }
-    } else if(!S_ISDIR(st->st_mode)) {
-      say_warn("'%s' isn't directory", current_dir);
-      return -1;
-    }
-  }
-  return 0;
-}
-
-/*
-local function file_write(path, data, opts, perm)
-    checks('string', 'string', '?table', '?number')
-    opts = opts or {'O_CREAT', 'O_WRONLY', 'O_TRUNC'}
-    perm = perm or tonumber(644, 8)
-    local file = fio.open(path, opts, perm)
-    if file == nil then
-        return nil, OpenFileError:new('%s: %s', path, errno.strerror())
-    end
-
-    local res = file:write(data)
-    if not res then
-        local err = WriteFileError:new('%s: %s', path, errno.strerror())
-        fio.unlink(path)
-        return nil, err
-    end
-
-    local res = file:close()
-    if not res then
-        local err = WriteFileError:new('%s: %s', path, errno.strerror())
-        fio.unlink(path)
-        return nil, err
-    end
-
-    return data
-end
-*/
+// NOTE: Open flags like in clusterwide-config.save
+// NOTE: Open mode value is ok for this purpose, i guess
 static int file_write(const char* path, const char* data) {
-  // NOTE: Flags like in clusterwide-config.save
-  // NOTE: Mode is ok for this purpose, i guess
   int fd = open(path, O_CREAT | O_EXCL | O_WRONLY | O_SYNC,
                 S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
   if(fd == -1) {
-    say_error("cant open file: %s, err: %s", path, strerror(errno));
+    say_error("open() error: %s, path: %s", strerror(errno), path);
     return -1;
   }
   int count = strlen(data);
@@ -138,13 +41,14 @@ static int file_write(const char* path, const char* data) {
     say_warn("data wasn't written correctly, count of written bytes: %ld, expected: %d", nr, count);
   }
   if(close(fd) == -1) {
-    say_error("close error: %s", strerror(errno));
+    say_error("close() error: %s", strerror(errno));
     return -1;
   }
+  say_verbose("%s has written", path);
   return 0;
 }
 
-static int va_file_write(va_list argp) {
+static ssize_t va_file_write(va_list argp) {
   const char* path = va_arg(argp, char*);
   const char* data = va_arg(argp, char*);
   return file_write(path, data);
@@ -154,92 +58,95 @@ static int lua_file_write(lua_State *L) {
   const char* path = luaL_checkstring(L, -2);
   const char* data = luaL_checkstring(L, -1);
   if(coio_call(va_file_write, path, data) == -1 ) {
-    say_error("coio call error: %s", strerror(errno));
+    say_error("coio_call() error: %s", strerror(errno));
     return -1;
   }
   return 0;
 }
 
-/*
-  local function save(clusterwide_config, path)
-    checks('ClusterwideConfig', 'string')
-    local random_path = utils.randomize_path(path)
+// FIXME: strtok is thread-unsafe, that's why there mutex is needed,
+// need to find thread-safe replacement
+static int mktree(char* path) {
+  char* tmp_path = strdup(path);
+  // FIXME: here possible buffer overflow
+  char current_dir[512] = "."; // FIXME: must be "/"
+  char* ctxptr;
+  /* struct stat* st = malloc(sizeof(struct stat)); */
+  struct stat st;
+  char* dir = strtok(tmp_path, "/");
+  while(dir != NULL) {
+    char* tmp_dir = strdup(current_dir);
+    sprintf(current_dir, "%s/%s", tmp_dir, dir);
+    mode_t mode = 0744;
+    int stat_rc = stat(current_dir, &st);
+    say_info("current_dir: %s", current_dir);
+    if(stat_rc == -1) {
+      if(mkdir(current_dir, mode) ==  -1) {
+        say_error("mkdir() error: %s, path: %s, mode: %x", strerror(errno), current_dir, mode);
+        return -1;
+      } else {
+        say_info("Directory '%s' has created", current_dir);
+      }
+    } else if(!S_ISDIR(st.st_mode)) {
+      say_warn("path: %s : %s", current_dir, strerror(EEXIST));
+      return -1;
+    }
+    dir = strtok(NULL, "/");
+  }
+  return 0;
+}
 
-    local ok, err = utils.mktree(random_path)
-    if not ok then
-        return nil, err
-    end
+static ssize_t va_mktree(va_list ap) {
+  char* path = va_arg(ap, char*);
+  int n = va_arg(ap, int);
+  return mktree(path);
+}
 
-    for section, content in pairs(clusterwide_config._plaintext) do
-        local abspath = fio.pathjoin(random_path, section)
-        local dirname = fio.dirname(abspath)
 
-        ok, err = utils.mktree(dirname)
-        if not ok then
-            goto rollback
-        end
+static int lua_mktree(lua_State *L) {
+  const char* path = luaL_checkstring(L, 1);
+  if(coio_call(va_mktree, path) == -1) {
+    say_error("coio_call() error");
+    return 1;
+  }
+  return 0;
+}
 
-        ok, err = utils.file_write(
-            abspath, content,
-            {'O_CREAT', 'O_EXCL', 'O_WRONLY', 'O_SYNC'}
-        )
-        if not ok then
-            goto rollback
-        end
-    end
-
-    ok = fio.rename(random_path, path)
-    if not ok then
-        err = SaveConfigError:new(
-            '%s: %s',
-            path, errno.strerror()
-        )
-        goto rollback
-    else
-        return true
-    end
-
-::rollback::
-    local ok, _err = fio.rmtree(random_path)
-    if not ok then
-        log.warn(
-            "Error removing %s: %s",
-            random_path, _err
-        )
-    end
-
-    return nil, err
-end
-*/
-// TODO: rollback scenario (remove tmp directory)
 // FIXME: proper "mktree"
 // FIXME: remove "config.prepare" harcode string
-static int cw_save(char* random_path, char** sections_k, char** sections_v, int section_l) {
-  char* dirs[1];
-  dirs[0] = random_path;
-  if(mktree(dirs, 1) == -1 ) {
-    say_warn("cant create tree");
+static int cw_save(char* path, char** sections_k, char** sections_v, int section_l) {
+  /* pthread_mutex_lock(&m); */
+  if(mktree(path) == -1 ) {
+    say_error("mktree() error");
     return -1;
   }
+
   for (int i = 0; i < section_l; i++) {
-    char* path = malloc((sizeof random_path + sizeof sections_k[i]) * sizeof(char*));
-    sprintf(path, "%s/%s", random_path, sections_k[i]);
-    say_info("path: %s", path);
-    if(file_write(path, sections_v[i]) == -1) {
-      say_error("file write error: %s", strerror(errno));
-      free(path);
-      return -1;
-    };
-    free(path);
+    char tmp_path[512];
+    sprintf(tmp_path, "%s/%s", path, sections_k[i]);
+    if(file_write(tmp_path, sections_v[i]) == -1) {
+      say_error("file_write() error: %s", strerror(errno));
+      goto rollback;
+    }
   }
-  if(rename(random_path, "config.prepare") == -1) {
+
+  if(rename(path, "tmp/config.prepare") == -1) {
     say_error("rename() error: %s", strerror(errno));
-    return -1;
+    goto rollback;
   }
+
+  say_verbose("%s has renamed to tmp/config.prepare", path);
+  goto exit;
+rollback:
+  if(remove(path) == -1) {
+    say_error("remove error: %s, path: %s", strerror(errno), path);
+  }
+  return -1;
+exit:
   return 0;
 }
 
-static int va_cw_save(va_list argp) {
+static ssize_t va_cw_save(va_list argp) {
   char* path = va_arg(argp, char*);
   char** keys = va_arg(argp, char**);
   char** values = va_arg(argp, char**);
@@ -249,7 +156,6 @@ static int va_cw_save(va_list argp) {
 
 static int lua_cw_save(lua_State *L) {
   const char* path = luaL_checkstring(L, 1);
-  say_info("%s", path);
   int v = 1;
   const char* sections_v[100];
     do {
@@ -292,77 +198,38 @@ static int lua_cw_save(lua_State *L) {
   }
 
   if(coio_call(va_cw_save, path, sections_k, sections_v, k-1) == -1) {
-    say_error("error coio_call");
-    say_error("%s", strerror(errno));
-    return 1;
+    say_error("coio_call() error");
+    return -1;
   }
 
   return 0;
 }
 
-static int va_mktree(va_list ap) {
-  char** dirs = va_arg(ap, char**);
-  int n = va_arg(ap, int);
-  return mktree(dirs, n);
-}
-
-
-static int lua_mktree(lua_State *L) {
-  const char* dirs[100];
-  int i = 1;
-  do {
-    lua_pushnumber(L, i);
-    lua_gettable(L, -2);
-    if(lua_isnoneornil(L, -1))
-      break;
-
-    if(!lua_isstring(L, -1)) {
-      const char* _type = luaL_typename(L, -1);
-      say_error("wrong format of table field at index %d: expect string, actual is %s", i, _type);
-      return -1;
-    }
-    dirs[i-1] = lua_tostring(L, -1);
-    lua_pop(L, 1);
-    i++;
-  } while(true);
-
-  long long before = fiber_clock64();
-  if(coio_call(va_mktree, dirs, i) == -1) {
-    say_error("error coio_call");
-    say_error("%s", strerror(errno));
-    return 1;
-  }
-  long long after = fiber_clock64();
-  long long dur = (after - before) / 1e3;
-  say_info("coio_call duration ms: %lld", dur);
+static ssize_t _say_info() {
+  say_info("debug");
   return 0;
 }
 
-
-static int run(lua_State *L) {
-  const char* dirname = luaL_checkstring(L, -1);
-  long long before = fiber_clock64();
-  if(coio_call(va_mkdir, dirname)) {
-    say_error("error coio_call");
-    return 1;
+static int lua_say_info(lua_State *L) {
+  if(coio_call(_say_info) == -1) {
+    say_error("coio_call() error");
+    return -1;
   }
-  long long after = fiber_clock64();
-  long long dur = (after - before) / 1e3;
-  say_info("coio_call duration ms: %lld", dur);
   return 0;
 }
-
 
 static const struct luaL_Reg functions[] = {
-  {"run", run},
+  {"say_info", lua_say_info},
   {"mktree", lua_mktree},
   {"file_write", lua_file_write},
   {"cw_save", lua_cw_save},
   {NULL, NULL}
 };
 
+
 // NOTE: why i need to use "luaopen_" prefix?
 int luaopen_hello(lua_State *L) {
+  pthread_mutex_init(&m, NULL);
   luaL_register(L, "hello", functions);
   return 1;
 }
