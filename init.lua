@@ -32,16 +32,32 @@ do
         end
     end)
 
+    -- log.info('file write start');
+    -- local rc = hello.file_write("debug.txt", "data to write");
+    -- if rc == -1 then
+    --     log.error("error from file_write")
+    --     return;
+    -- end
+    -- log.info('file write end');
+
+
     -- fiber.create(function()
         -- log.info("fiber.create with coio call for debug")
         -- hello.run('./tmp_dir')
         -- log.info("coio call finished")
     -- end)
 
+    -- fiber.create(function()
+    --     log.info("fiber.create with coio call mktree")
+    --     hello.mktree({"debug", "directory", "gygyk"})
+    --     log.info("coio call finished")
+    -- end)
+
+
     fiber.create(function()
-        log.info("fiber.create with coio call mktree")
-        hello.mktree({"debug", "directory", "gygyk"})
-        log.info("coio call finished")
+        log.info("cw start")
+        hello.cw_save("random_path", {"a.txt", "b.txt", "c.txt"}, {"a a a a", "b b b b", "c c c c"})
+        log.info("cw end")
     end)
 
     os.exit()
